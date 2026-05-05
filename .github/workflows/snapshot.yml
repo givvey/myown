@@ -1,0 +1,181 @@
+name: Webpage Snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL of the webpage to snapshot"
+        required: true
+        default: "https://example.com"
+      filename:
+        description: "Output filename (without extension)"
+        required: false
+        default: "snapshot"
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Playwright & dependencies
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install chromium --with-deps
+
+      - name: Set snapshot variables
+        id: vars
+        run: |
+          URL="${{ github.event.inputs.url || 'https://example.com' }}"
+          FILENAME="${{ github.event.inputs.filename || 'snapshot' }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "output_file=${FILENAME}.html" >> $GITHUB_OUTPUT
+
+      - name: Capture webpage snapshot
+        run: |
+          cat << 'EOF' > capture.mjs
+          import { chromium } from "playwright";
+          import fs from "fs";
+
+          const url = process.env.TARGET_URL;
+          const outputFile = process.env.OUTPUT_FILE;
+
+          console.log(`📸 Snapshotting: ${url}`);
+
+          const browser = await chromium.launch();
+          const context = await browser.newContext({
+            viewport: { width: 1440, height: 900 },
+            userAgent:
+              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          });
+
+          const page = await context.newPage();
+
+          // Navigate and wait until network is idle
+          await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
+
+          // Scroll to bottom to trigger lazy-loaded content, then back to top
+          await page.evaluate(async () => {
+            await new Promise((resolve) => {
+              let totalHeight = 0;
+              const distance = 300;
+              const timer = setInterval(() => {
+                window.scrollBy(0, distance);
+                totalHeight += distance;
+                if (totalHeight >= document.body.scrollHeight) {
+                  clearInterval(timer);
+                  window.scrollTo(0, 0);
+                  resolve();
+                }
+              }, 80);
+            });
+          });
+
+          // Brief pause after scroll
+          await page.waitForTimeout(1000);
+
+          // Inline all external resources into a single self-contained HTML file
+          const html = await page.evaluate(async () => {
+            // Helper: fetch a URL and return a base64 data URI
+            async function toDataURI(src, defaultMime) {
+              try {
+                const res = await fetch(src);
+                if (!res.ok) return src;
+                const mime =
+                  res.headers.get("content-type")?.split(";")[0] || defaultMime;
+                const buf = await res.arrayBuffer();
+                const b64 = btoa(
+                  String.fromCharCode(...new Uint8Array(buf))
+                );
+                return `data:${mime};base64,${b64}`;
+              } catch {
+                return src;
+              }
+            }
+
+            // Inline <link rel="stylesheet"> as <style>
+            const styleLinks = [
+              ...document.querySelectorAll('link[rel="stylesheet"]'),
+            ];
+            for (const link of styleLinks) {
+              try {
+                const res = await fetch(link.href);
+                if (res.ok) {
+                  const css = await res.text();
+                  const style = document.createElement("style");
+                  style.textContent = css;
+                  link.replaceWith(style);
+                }
+              } catch {
+                /* keep original */
+              }
+            }
+
+            // Inline <img src> as data URIs
+            const images = [...document.querySelectorAll("img[src]")];
+            for (const img of images) {
+              img.src = await toDataURI(img.src, "image/png");
+              img.removeAttribute("srcset");
+              img.removeAttribute("loading");
+            }
+
+            // Inline <script src> as inline <script>
+            const scripts = [
+              ...document.querySelectorAll("script[src]"),
+            ];
+            for (const s of scripts) {
+              try {
+                const res = await fetch(s.src);
+                if (res.ok) {
+                  const code = await res.text();
+                  const inlined = document.createElement("script");
+                  inlined.textContent = code;
+                  s.replaceWith(inlined);
+                }
+              } catch {
+                /* keep original */
+              }
+            }
+
+            return document.documentElement.outerHTML;
+          });
+
+          // Prepend DOCTYPE and a metadata banner comment
+          const snapshotTime = new Date().toISOString();
+          const output =
+            `<!DOCTYPE html>\n` +
+            `<!-- Snapshot of: ${url} | Captured: ${snapshotTime} -->\n` +
+            html;
+
+          fs.writeFileSync(outputFile, output, "utf8");
+          console.log(`✅ Saved to ${outputFile} (${(output.length / 1024).toFixed(1)} KB)`);
+
+          await browser.close();
+          EOF
+
+          TARGET_URL="${{ steps.vars.outputs.url }}" \
+          OUTPUT_FILE="${{ steps.vars.outputs.output_file }}" \
+          node capture.mjs
+
+      - name: Upload snapshot as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webpage-snapshot-${{ steps.vars.outputs.timestamp }}
+          path: ${{ steps.vars.outputs.output_file }}
+          retention-days: 30
+          
