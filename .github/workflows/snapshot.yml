@@ -11,6 +11,10 @@ on:
         description: "Output filename (without extension)"
         required: false
         default: "snapshot"
+      wait_ms:
+        description: "Extra time (ms) to wait after page load for JS rendering"
+        required: false
+        default: "3000"
 
 permissions:
   contents: write
@@ -28,169 +32,77 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install Playwright & dependencies
+      # single-file-cli is the official CLI of the SingleFile extension.
+      # It ships its own Chromium via @puppeteer/browsers so no separate
+      # browser install step is needed.
+      - name: Install single-file-cli
+        run: npm install -g single-file-cli
+
+      - name: Install Chromium for single-file-cli
         run: |
-          npm init -y
-          npm install playwright
-          npx playwright install chromium --with-deps
+          # single-file-cli resolves the browser via the SINGLE_FILE_BROWSER
+          # env var or auto-downloads one. We install it explicitly so we can
+          # pin the path and avoid the interactive prompt.
+          npx @puppeteer/browsers install chrome@stable --path "$HOME/.chrome"
+          CHROME_BIN=$(find "$HOME/.chrome" -name "chrome" -type f | head -n 1)
+          echo "CHROME_BIN=$CHROME_BIN" >> $GITHUB_ENV
 
       - name: Set snapshot variables
         id: vars
         run: |
           URL="${{ github.event.inputs.url || 'https://example.com' }}"
           FILENAME="${{ github.event.inputs.filename || 'snapshot' }}"
+          WAIT_MS="${{ github.event.inputs.wait_ms || '3000' }}"
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
-          echo "url=$URL" >> $GITHUB_OUTPUT
-          echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
-          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "url=$URL"                    >> $GITHUB_OUTPUT
+          echo "filename=$FILENAME"          >> $GITHUB_OUTPUT
+          echo "wait_ms=$WAIT_MS"            >> $GITHUB_OUTPUT
+          echo "timestamp=$TIMESTAMP"        >> $GITHUB_OUTPUT
           echo "output_file=${FILENAME}.html" >> $GITHUB_OUTPUT
 
-      - name: Capture webpage snapshot
+      - name: Capture single-file snapshot
         run: |
-          cat << 'EOF' > capture.mjs
-          import { chromium } from "playwright";
-          import fs from "fs";
+          single-file \
+            "${{ steps.vars.outputs.url }}" \
+            "${{ steps.vars.outputs.output_file }}" \
+            --browser-executable-path="$CHROME_BIN" \
+            --browser-args='["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]' \
+            --browser-wait-until="networkidle0" \
+            --browser-wait-delay="${{ steps.vars.outputs.wait_ms }}" \
+            --compress-HTML=false \
+            --block-mixed-contents=false \
+            --load-deferred-images=true \
+            --load-deferred-images-max-idle-time=3000 \
+            --remove-hidden-elements=false \
+            --remove-unused-styles=false \
+            --remove-unused-fonts=false \
+            --remove-frames=false \
+            --save-raw-page=false \
+            --resolve-fragment-links=true
 
-          const url = process.env.TARGET_URL;
-          const outputFile = process.env.OUTPUT_FILE;
+          SIZE=$(du -sh "${{ steps.vars.outputs.output_file }}" | cut -f1)
+          echo "✅ Snapshot saved: ${{ steps.vars.outputs.output_file }} ($SIZE)"
 
-          console.log(`📸 Snapshotting: ${url}`);
-
-          const browser = await chromium.launch();
-          const context = await browser.newContext({
-            viewport: { width: 1440, height: 900 },
-            userAgent:
-              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
-              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          });
-
-          const page = await context.newPage();
-
-          // Navigate and wait until network is idle
-          await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
-
-          // Scroll to bottom to trigger lazy-loaded content, then back to top
-          await page.evaluate(async () => {
-            await new Promise((resolve) => {
-              let totalHeight = 0;
-              const distance = 300;
-              const timer = setInterval(() => {
-                window.scrollBy(0, distance);
-                totalHeight += distance;
-                if (totalHeight >= document.body.scrollHeight) {
-                  clearInterval(timer);
-                  window.scrollTo(0, 0);
-                  resolve();
-                }
-              }, 80);
-            });
-          });
-
-          // Brief pause after scroll
-          await page.waitForTimeout(1000);
-
-          // Inline all external resources into a single self-contained HTML file
-          const html = await page.evaluate(async () => {
-            // Helper: fetch a URL and return a base64 data URI
-            async function toDataURI(src, defaultMime) {
-              try {
-                const res = await fetch(src);
-                if (!res.ok) return src;
-                const mime =
-                  res.headers.get("content-type")?.split(";")[0] || defaultMime;
-                const buf = await res.arrayBuffer();
-                const b64 = btoa(
-                  String.fromCharCode(...new Uint8Array(buf))
-                );
-                return `data:${mime};base64,${b64}`;
-              } catch {
-                return src;
-              }
-            }
-
-            // Inline <link rel="stylesheet"> as <style>
-            const styleLinks = [
-              ...document.querySelectorAll('link[rel="stylesheet"]'),
-            ];
-            for (const link of styleLinks) {
-              try {
-                const res = await fetch(link.href);
-                if (res.ok) {
-                  const css = await res.text();
-                  const style = document.createElement("style");
-                  style.textContent = css;
-                  link.replaceWith(style);
-                }
-              } catch {
-                /* keep original */
-              }
-            }
-
-            // Inline <img src> as data URIs
-            const images = [...document.querySelectorAll("img[src]")];
-            for (const img of images) {
-              img.src = await toDataURI(img.src, "image/png");
-              img.removeAttribute("srcset");
-              img.removeAttribute("loading");
-            }
-
-            // Inline <script src> as inline <script>
-            const scripts = [
-              ...document.querySelectorAll("script[src]"),
-            ];
-            for (const s of scripts) {
-              try {
-                const res = await fetch(s.src);
-                if (res.ok) {
-                  const code = await res.text();
-                  const inlined = document.createElement("script");
-                  inlined.textContent = code;
-                  s.replaceWith(inlined);
-                }
-              } catch {
-                /* keep original */
-              }
-            }
-
-            return document.documentElement.outerHTML;
-          });
-
-          // Prepend DOCTYPE and a metadata banner comment
-          const snapshotTime = new Date().toISOString();
-          const output =
-            `<!DOCTYPE html>\n` +
-            `<!-- Snapshot of: ${url} | Captured: ${snapshotTime} -->\n` +
-            html;
-
-          fs.writeFileSync(outputFile, output, "utf8");
-          console.log(`✅ Saved to ${outputFile} (${(output.length / 1024).toFixed(1)} KB)`);
-
-          await browser.close();
-          EOF
-
-          TARGET_URL="${{ steps.vars.outputs.url }}" \
-          OUTPUT_FILE="${{ steps.vars.outputs.output_file }}" \
-          node capture.mjs
       - name: Commit snapshot to repository
         run: |
           DEST_DIR="snapshots"
           TIMESTAMP="${{ steps.vars.outputs.timestamp }}"
           FILENAME="${{ steps.vars.outputs.filename }}"
           OUTPUT_FILE="${{ steps.vars.outputs.output_file }}"
- 
+
           mkdir -p "$DEST_DIR"
- 
-          # Save a timestamped copy in snapshots/
+
+          # Timestamped archive copy
           cp "$OUTPUT_FILE" "$DEST_DIR/${FILENAME}-${TIMESTAMP}.html"
- 
-          # Also keep a "latest" copy for easy linking
+
+          # Stable "latest" pointer — easy to link or embed
           cp "$OUTPUT_FILE" "$DEST_DIR/${FILENAME}-latest.html"
- 
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
- 
+
           git add "$DEST_DIR/"
           git diff --cached --quiet && echo "No changes to commit." && exit 0
- 
+
           git commit -m "chore: snapshot ${{ steps.vars.outputs.url }} @ ${TIMESTAMP}"
           git push
