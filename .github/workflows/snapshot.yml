@@ -67,18 +67,23 @@ jobs:
             "${{ steps.vars.outputs.output_file }}" \
             --browser-executable-path="$CHROME_BIN" \
             --browser-args='["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]' \
-            --browser-wait-until="networkidle0" \
+            --browser-wait-until=networkIdle \
+            --browser-wait-until-fallback=true \
             --browser-wait-delay="${{ steps.vars.outputs.wait_ms }}" \
+            --block-scripts=false \
+            --block-mixed-content=false \
+            --block-alternative-images=false \
+            --self-extracting-archive=false \
             --compress-HTML=false \
-            --block-mixed-contents=false \
             --load-deferred-images=true \
             --load-deferred-images-max-idle-time=3000 \
             --remove-hidden-elements=false \
             --remove-unused-styles=false \
             --remove-unused-fonts=false \
+            --remove-alternative-fonts=false \
             --remove-frames=false \
-            --save-raw-page=false \
-            --resolve-fragment-links=true
+            --resolve-links=true \
+            --insert-single-file-comment=true
 
           SIZE=$(du -sh "${{ steps.vars.outputs.output_file }}" | cut -f1)
           echo "✅ Snapshot saved: ${{ steps.vars.outputs.output_file }} ($SIZE)"
