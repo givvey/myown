@@ -171,11 +171,26 @@ jobs:
           TARGET_URL="${{ steps.vars.outputs.url }}" \
           OUTPUT_FILE="${{ steps.vars.outputs.output_file }}" \
           node capture.mjs
-
-      - name: Upload snapshot as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: webpage-snapshot-${{ steps.vars.outputs.timestamp }}
-          path: ${{ steps.vars.outputs.output_file }}
-          retention-days: 30
-          
+      - name: Commit snapshot to repository
+        run: |
+          DEST_DIR="snapshots"
+          TIMESTAMP="${{ steps.vars.outputs.timestamp }}"
+          FILENAME="${{ steps.vars.outputs.filename }}"
+          OUTPUT_FILE="${{ steps.vars.outputs.output_file }}"
+ 
+          mkdir -p "$DEST_DIR"
+ 
+          # Save a timestamped copy in snapshots/
+          cp "$OUTPUT_FILE" "$DEST_DIR/${FILENAME}-${TIMESTAMP}.html"
+ 
+          # Also keep a "latest" copy for easy linking
+          cp "$OUTPUT_FILE" "$DEST_DIR/${FILENAME}-latest.html"
+ 
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+ 
+          git add "$DEST_DIR/"
+          git diff --cached --quiet && echo "No changes to commit." && exit 0
+ 
+          git commit -m "chore: snapshot ${{ steps.vars.outputs.url }} @ ${TIMESTAMP}"
+          git push
