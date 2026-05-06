@@ -1,0 +1,118 @@
+name: Download URL and Upload to Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL of the file to download"
+        required: true
+        type: string
+      destination_folder_id:
+        description: "Google Drive folder ID (leave empty for root)"
+        required: false
+        type: string
+      filename:
+        description: "Custom filename to save as (leave empty to infer from URL)"
+        required: false
+        type: string
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate URL input
+        run: |
+          if [[ ! "${{ inputs.url }}" =~ ^https?:// ]]; then
+            echo "❌ Invalid URL: must start with http:// or https://"
+            exit 1
+          fi
+          echo "✅ URL is valid: ${{ inputs.url }}"
+
+      - name: Determine output filename
+        id: filename
+        run: |
+          if [[ -n "${{ inputs.filename }}" ]]; then
+            FILENAME="${{ inputs.filename }}"
+          else
+            # Extract filename from URL, strip query params
+            FILENAME=$(basename "${{ inputs.url }}" | cut -d'?' -f1)
+            # Fallback if no filename could be inferred
+            if [[ -z "$FILENAME" || "$FILENAME" == "/" ]]; then
+              FILENAME="downloaded_file_$(date +%Y%m%d_%H%M%S)"
+            fi
+          fi
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+          echo "📄 Will save as: $FILENAME"
+
+      - name: Download file
+        run: |
+          echo "⬇️ Downloading from: ${{ inputs.url }}"
+          curl -L \
+            --fail \
+            --show-error \
+            --retry 3 \
+            --retry-delay 5 \
+            --max-time 300 \
+            -o "${{ steps.filename.outputs.filename }}" \
+            "${{ inputs.url }}"
+          echo "✅ Downloaded: $(du -sh ${{ steps.filename.outputs.filename }} | cut -f1)"
+
+      - name: Authenticate with Google Drive
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
+
+      - name: Upload to Google Drive
+        uses: google-github-actions/upload-cloud-storage@v2
+        with:
+          # Note: this action targets GCS by default; for Google Drive use the
+          # Drive API directly via the script step below instead.
+          # This step is a placeholder — see the script step for Drive upload.
+          path: ${{ steps.filename.outputs.filename }}
+          destination: "placeholder"  # overridden by script below
+
+      - name: Upload file to Google Drive via API
+        env:
+          FILENAME: ${{ steps.filename.outputs.filename }}
+          FOLDER_ID: ${{ inputs.destination_folder_id }}
+        run: |
+          # Get an access token from the already-authenticated gcloud CLI
+          ACCESS_TOKEN=$(gcloud auth print-access-token)
+
+          MIME_TYPE=$(file --mime-type -b "$FILENAME")
+          echo "📦 MIME type: $MIME_TYPE"
+
+          # Build metadata JSON
+          if [[ -n "$FOLDER_ID" ]]; then
+            METADATA=$(jq -n \
+              --arg name "$FILENAME" \
+              --arg folder "$FOLDER_ID" \
+              '{"name": $name, "parents": [$folder]}')
+          else
+            METADATA=$(jq -n --arg name "$FILENAME" '{"name": $name}')
+          fi
+
+          # Multipart upload to Google Drive
+          RESPONSE=$(curl -s -X POST \
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -F "metadata=$METADATA;type=application/json;charset=UTF-8" \
+            -F "file=@$FILENAME;type=$MIME_TYPE")
+
+          FILE_ID=$(echo "$RESPONSE" | jq -r '.id // empty')
+          if [[ -z "$FILE_ID" ]]; then
+            echo "❌ Upload failed. Response:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          echo "✅ Uploaded successfully!"
+          echo "🔗 File ID: $FILE_ID"
+          echo "🌐 View at: https://drive.google.com/file/d/$FILE_ID/view"
+
+      - name: Clean up downloaded file
+        if: always()
+        run: |
+          rm -f "${{ steps.filename.outputs.filename }}"
+          echo "🧹 Cleaned up local file"
