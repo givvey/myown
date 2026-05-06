@@ -17,6 +17,15 @@ on:
         required: false
         type: string
         default: "4"
+      scope_exclude_rx:
+        description: >
+          Regex of URLs to exclude from the crawl (passed to --scopeExcludeRx).
+          Leave blank to crawl everything in scope.
+          Example — exclude all non-English FastAPI docs:
+            https://fastapi\.tiangolo\.com/[a-z]{2}(-[a-z]+)?(/|$)
+        required: false
+        type: string
+        default: ""
 
 jobs:
   crawl:
@@ -39,6 +48,15 @@ jobs:
 
       - name: Run crawler
         run: |
+          # Build the optional --scopeExcludeRx flag so the docker command
+          # stays clean regardless of whether the input was provided.
+          # The input is read from an env var to avoid shell-injection from
+          # regex metacharacters being interpolated directly into the script.
+          EXCLUDE_FLAG=""
+          if [ -n "$SCOPE_EXCLUDE_RX" ]; then
+            EXCLUDE_FLAG="--scopeExcludeRx $SCOPE_EXCLUDE_RX"
+          fi
+
           docker run \
             --rm \
             -v "${{ github.workspace }}/crawls:/crawls" \
@@ -50,7 +68,10 @@ jobs:
               --workers "${{ github.event.inputs.workers }}" \
               --behaviors autofetch,autoscroll \
               --waitUntil networkidle0 \
-              --generateWACZ
+              --generateWACZ \
+              $EXCLUDE_FLAG
+        env:
+          SCOPE_EXCLUDE_RX: ${{ github.event.inputs.scope_exclude_rx }}
 
       - name: Locate WACZ file
         id: find_wacz
