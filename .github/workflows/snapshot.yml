@@ -1,145 +1,104 @@
-name: Webpage Snapshot
+name: Web Archive Crawl
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "URL of the webpage to snapshot"
+        description: "URL to crawl"
         required: true
-        default: "https://example.com"
-      filename:
-        description: "Output filename (without extension)"
+        type: string
+      collection:
+        description: "Collection name (used for the output filename)"
+        required: true
+        type: string
+        default: "crawl"
+      workers:
+        description: "Number of parallel workers"
         required: false
-        default: "snapshot"
-      wait_ms:
-        description: "Extra time (ms) to wait after page load for JS rendering"
+        type: string
+        default: "4"
+      scope_exclude_rx:
+        description: >
+          Regex of URLs to exclude from the crawl (passed to --scopeExcludeRx).
+          Leave blank to crawl everything in scope.
+          Example — exclude all non-English FastAPI docs:
+            https://fastapi\.tiangolo\.com/[a-z]{2}(-[a-z]+)?(/|$)
         required: false
-        default: "3000"
-
-permissions:
-  contents: write
+        type: string
+        default: ""
 
 jobs:
-  snapshot:
+  crawl:
     runs-on: ubuntu-latest
+    # Crawls can be long — raise the timeout as needed
+    timeout-minutes: 120
+
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+      - name: Pull browsertrix-crawler image
+        run: docker pull webrecorder/browsertrix-crawler
 
-      # single-file-cli is the official CLI of the SingleFile extension.
-      # It ships its own Chromium via @puppeteer/browsers so no separate
-      # browser install step is needed.
-      - name: Install single-file-cli
-        run: npm install -g single-file-cli
+      - name: Create crawl output directory
+        run: mkdir -p crawls
 
-      - name: Install Chromium for single-file-cli
+      - name: Run crawler
         run: |
-          # single-file-cli resolves the browser via the SINGLE_FILE_BROWSER
-          # env var or auto-downloads one. We install it explicitly so we can
-          # pin the path and avoid the interactive prompt.
-          npx @puppeteer/browsers install chrome@stable --path "$HOME/.chrome"
-          CHROME_BIN=$(find "$HOME/.chrome" -name "chrome" -type f | head -n 1)
-          echo "CHROME_BIN=$CHROME_BIN" >> $GITHUB_ENV
+          # Build the optional --scopeExcludeRx flag so the docker command
+          # stays clean regardless of whether the input was provided.
+          # The input is read from an env var to avoid shell-injection from
+          # regex metacharacters being interpolated directly into the script.
+          EXCLUDE_FLAG=""
+          if [ -n "$SCOPE_EXCLUDE_RX" ]; then
+            EXCLUDE_FLAG="--scopeExcludeRx $SCOPE_EXCLUDE_RX"
+          fi
 
-      - name: Set snapshot variables
-        id: vars
+          docker run \
+            --rm \
+            -v "${{ github.workspace }}/crawls:/crawls" \
+            webrecorder/browsertrix-crawler \
+            crawl \
+              --url "${{ github.event.inputs.url }}" \
+              --collection "${{ github.event.inputs.collection }}" \
+              --scopeType prefix \
+              --workers "${{ github.event.inputs.workers }}" \
+              --behaviors autofetch,autoscroll \
+              --waitUntil networkidle0 \
+              --generateWACZ \
+              $EXCLUDE_FLAG
+        env:
+          SCOPE_EXCLUDE_RX: ${{ github.event.inputs.scope_exclude_rx }}
+
+      - name: Locate WACZ file
+        id: find_wacz
         run: |
-          URL="${{ github.event.inputs.url || 'https://example.com' }}"
-          FILENAME="${{ github.event.inputs.filename || 'snapshot' }}"
-          WAIT_MS="${{ github.event.inputs.wait_ms || '3000' }}"
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
-          echo "url=$URL"                    >> $GITHUB_OUTPUT
-          echo "filename=$FILENAME"          >> $GITHUB_OUTPUT
-          echo "wait_ms=$WAIT_MS"            >> $GITHUB_OUTPUT
-          echo "timestamp=$TIMESTAMP"        >> $GITHUB_OUTPUT
-          echo "output_file=${FILENAME}.html" >> $GITHUB_OUTPUT
+          WACZ_PATH=$(find crawls -name "*.wacz" | head -n 1)
 
-      - name: Write lazy-load scroll script
+          if [ -z "$WACZ_PATH" ]; then
+            echo "No WACZ file found — crawl may have failed."
+            exit 1
+          fi
+
+          echo "wacz_path=$WACZ_PATH" >> "$GITHUB_OUTPUT"
+          echo "Found WACZ: $WACZ_PATH"
+          ls -lh "$WACZ_PATH"
+
+      - name: Commit WACZ to repository
         run: |
-          cat << 'JS' > /tmp/scroll-trigger.js
-          // Scrolls the full page height in increments to trigger
-          // IntersectionObserver, scroll-event listeners, and any
-          // JS-driven lazy loading. Waits for network to settle after
-          // each batch, then scrolls back to the top.
-          (async () => {
-            const sleep = ms => new Promise(r => setTimeout(r, ms));
-            const pageHeight = () => document.documentElement.scrollHeight;
-
-            let pos = 0;
-            const step = Math.floor(window.innerHeight * 0.8);
-
-            while (pos < pageHeight()) {
-              window.scrollTo(0, pos);
-              // Fire scroll event explicitly for listeners that check it
-              window.dispatchEvent(new Event('scroll'));
-              await sleep(120);
-              pos += step;
-            }
-
-            // Pause at the bottom so final lazy assets can start loading
-            await sleep(1500);
-            window.scrollTo(0, 0);
-            await sleep(500);
-          })();
-          JS
-
-      - name: Capture single-file snapshot
-        run: |
-          single-file \
-            "${{ steps.vars.outputs.url }}" \
-            "${{ steps.vars.outputs.output_file }}" \
-            --browser-executable-path="$CHROME_BIN" \
-            --browser-args='["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]' \
-            --browser-wait-until=networkIdle \
-            --browser-wait-until-fallback=true \
-            --browser-wait-delay="${{ steps.vars.outputs.wait_ms }}" \
-            --browser-script=/tmp/scroll-trigger.js \
-            --block-scripts=false \
-            --block-mixed-content=false \
-            --block-alternative-images=false \
-            --self-extracting-archive=false \
-            --compress-HTML=false \
-            --load-deferred-images=true \
-            --load-deferred-images-dispatch-scroll-event=true \
-            --load-deferred-images-max-idle-time=5000 \
-            --load-deferred-images-before-frames=true \
-            --remove-hidden-elements=false \
-            --remove-unused-styles=false \
-            --remove-unused-fonts=false \
-            --remove-alternative-fonts=false \
-            --remove-frames=false \
-            --resolve-links=true \
-            --insert-single-file-comment=true
-
-          SIZE=$(du -sh "${{ steps.vars.outputs.output_file }}" | cut -f1)
-          echo "✅ Snapshot saved: ${{ steps.vars.outputs.output_file }} ($SIZE)"
-
-      - name: Commit snapshot to repository
-        run: |
-          DEST_DIR="snapshots"
-          TIMESTAMP="${{ steps.vars.outputs.timestamp }}"
-          FILENAME="${{ steps.vars.outputs.filename }}"
-          OUTPUT_FILE="${{ steps.vars.outputs.output_file }}"
-
-          mkdir -p "$DEST_DIR"
-
-          # Timestamped archive copy
-          cp "$OUTPUT_FILE" "$DEST_DIR/${FILENAME}-${TIMESTAMP}.html"
-
-          # Stable "latest" pointer — easy to link or embed
-          cp "$OUTPUT_FILE" "$DEST_DIR/${FILENAME}-latest.html"
-
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add "$DEST_DIR/"
-          git diff --cached --quiet && echo "No changes to commit." && exit 0
+          git add "${{ steps.find_wacz.outputs.wacz_path }}"
 
-          git commit -m "chore: snapshot ${{ steps.vars.outputs.url }} @ ${TIMESTAMP}"
-          git push
+          # Only commit if there is something staged
+          if git diff --cached --quiet; then
+            echo "Nothing to commit — WACZ unchanged."
+          else
+            TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            git commit -m "chore: add WACZ archive for ${{ github.event.inputs.collection }} ($TIMESTAMP)"
+            git push
+          fi
