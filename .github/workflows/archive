@@ -1,0 +1,83 @@
+name: Web Archive Crawl
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL to crawl"
+        required: true
+        type: string
+      collection:
+        description: "Collection name (used for the output filename)"
+        required: true
+        type: string
+        default: "crawl"
+      workers:
+        description: "Number of parallel workers"
+        required: false
+        type: string
+        default: "4"
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    # Crawls can be long — raise the timeout as needed
+    timeout-minutes: 120
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Pull browsertrix-crawler image
+        run: docker pull webrecorder/browsertrix-crawler
+
+      - name: Create crawl output directory
+        run: mkdir -p crawls
+
+      - name: Run crawler
+        run: |
+          docker run \
+            --rm \
+            -v "${{ github.workspace }}/crawls:/crawls" \
+            webrecorder/browsertrix-crawler \
+            crawl \
+              --url "${{ github.event.inputs.url }}" \
+              --collection "${{ github.event.inputs.collection }}" \
+              --scopeType prefix \
+              --workers "${{ github.event.inputs.workers }}" \
+              --behaviors autofetch,autoscroll \
+              --waitUntil networkidle0 \
+              --generateWACZ
+
+      - name: Locate WACZ file
+        id: find_wacz
+        run: |
+          WACZ_PATH=$(find crawls -name "*.wacz" | head -n 1)
+
+          if [ -z "$WACZ_PATH" ]; then
+            echo "No WACZ file found — crawl may have failed."
+            exit 1
+          fi
+
+          echo "wacz_path=$WACZ_PATH" >> "$GITHUB_OUTPUT"
+          echo "Found WACZ: $WACZ_PATH"
+          ls -lh "$WACZ_PATH"
+
+      - name: Commit WACZ to repository
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ steps.find_wacz.outputs.wacz_path }}"
+
+          # Only commit if there is something staged
+          if git diff --cached --quiet; then
+            echo "Nothing to commit — WACZ unchanged."
+          else
+            TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            git commit -m "chore: add WACZ archive for ${{ github.event.inputs.collection }} ($TIMESTAMP)"
+            git push
+          fi
