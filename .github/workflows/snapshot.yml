@@ -60,6 +60,35 @@ jobs:
           echo "timestamp=$TIMESTAMP"        >> $GITHUB_OUTPUT
           echo "output_file=${FILENAME}.html" >> $GITHUB_OUTPUT
 
+      - name: Write lazy-load scroll script
+        run: |
+          cat << 'JS' > /tmp/scroll-trigger.js
+          // Scrolls the full page height in increments to trigger
+          // IntersectionObserver, scroll-event listeners, and any
+          // JS-driven lazy loading. Waits for network to settle after
+          // each batch, then scrolls back to the top.
+          (async () => {
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
+            const pageHeight = () => document.documentElement.scrollHeight;
+
+            let pos = 0;
+            const step = Math.floor(window.innerHeight * 0.8);
+
+            while (pos < pageHeight()) {
+              window.scrollTo(0, pos);
+              // Fire scroll event explicitly for listeners that check it
+              window.dispatchEvent(new Event('scroll'));
+              await sleep(120);
+              pos += step;
+            }
+
+            // Pause at the bottom so final lazy assets can start loading
+            await sleep(1500);
+            window.scrollTo(0, 0);
+            await sleep(500);
+          })();
+          JS
+
       - name: Capture single-file snapshot
         run: |
           single-file \
@@ -70,13 +99,16 @@ jobs:
             --browser-wait-until=networkIdle \
             --browser-wait-until-fallback=true \
             --browser-wait-delay="${{ steps.vars.outputs.wait_ms }}" \
+            --browser-script=/tmp/scroll-trigger.js \
             --block-scripts=false \
             --block-mixed-content=false \
             --block-alternative-images=false \
             --self-extracting-archive=false \
             --compress-HTML=false \
             --load-deferred-images=true \
-            --load-deferred-images-max-idle-time=3000 \
+            --load-deferred-images-dispatch-scroll-event=true \
+            --load-deferred-images-max-idle-time=5000 \
+            --load-deferred-images-before-frames=true \
             --remove-hidden-elements=false \
             --remove-unused-styles=false \
             --remove-unused-fonts=false \
