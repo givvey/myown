@@ -1,0 +1,79 @@
+name: Download File and Upload
+
+on:
+  # Run manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: "URL of the file to download"
+        required: true
+        default: "https://example.com/file.zip"
+      file_name:
+        description: "Name to save the file as"
+        required: true
+        default: "downloaded_file"
+
+  # Also run on a schedule (optional — remove if not needed)
+  schedule:
+    - cron: "0 6 * * 1" # Every Monday at 06:00 UTC
+
+  # Also trigger on push to main (optional — remove if not needed)
+  push:
+    branches:
+      - main
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # Required to push the file back to the repository
+
+    steps:
+      # ── 1. Checkout the repository ──────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Download the file ─────────────────────────────────────────────────
+      - name: Download file from URL
+        run: |
+          # Resolve the URL and file name.
+          # When triggered by workflow_dispatch the inputs are used;
+          # for push/schedule triggers fall back to the hardcoded defaults below.
+          FILE_URL="${{ github.event.inputs.file_url || 'https://example.com/file.zip' }}"
+          FILE_NAME="${{ github.event.inputs.file_name || 'downloaded_file' }}"
+
+          echo "Downloading: $FILE_URL"
+          echo "Saving as:   $FILE_NAME"
+
+          # -L  follow redirects
+          # -f  fail fast on HTTP errors (non-zero exit code)
+          # -S  show errors even with -s
+          # -o  output file name
+          curl -LfS "$FILE_URL" -o "$FILE_NAME"
+
+          echo "FILE_NAME=$FILE_NAME" >> "$GITHUB_ENV"
+
+      # ── 3. Commit the file to the repository ────────────────────────────────
+      - name: Commit file to repository
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Move the file into a dedicated folder so the repo stays tidy
+          mkdir -p downloads
+          mv "$FILE_NAME" downloads/
+
+          git add downloads/"$FILE_NAME"
+
+          # Only commit when there are actual changes
+          if git diff --cached --quiet; then
+            echo "No changes to commit (file is identical to the existing one)."
+          else
+            git commit -m "chore: add downloaded file '$FILE_NAME' [skip ci]"
+            git push
+            echo "File committed and pushed successfully."
+          fi
+
+          # Fail the step if the file is somehow missing
+          if-no-files-found: error
