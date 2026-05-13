@@ -1,0 +1,1 @@
+Microsoft.VisualStudio.Services.VSIXPackage filter=lfs diff=lfs merge=lfs -text
