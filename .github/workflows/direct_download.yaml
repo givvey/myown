@@ -13,15 +13,6 @@ on:
         required: true
         default: "downloaded_file"
 
-  # Also run on a schedule (optional — remove if not needed)
-  schedule:
-    - cron: "0 6 * * 1" # Every Monday at 06:00 UTC
-
-  # Also trigger on push to main (optional — remove if not needed)
-  push:
-    branches:
-      - main
-
 jobs:
   download-and-upload:
     runs-on: ubuntu-latest
