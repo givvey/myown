@@ -1,0 +1,80 @@
+name: Download & Send via Rubika
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'Direct URL of the file to download'
+        required: true
+        type: string
+
+jobs:
+  download_and_send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y curl zip jq
+
+      - name: Download file
+        id: download
+        run: |
+          # Extract filename from URL, strip query string
+          FILE_NAME=$(basename "${{ github.event.inputs.file_url }}" | sed 's/?.*//')
+          if [ -z "$FILE_NAME" ]; then
+            FILE_NAME="downloaded_file"
+          fi
+          curl -fsSL -o "$FILE_NAME" "${{ github.event.inputs.file_url }}"
+          echo "file_name=$FILE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Zip with maximum compression & split into 50 MB chunks
+        id: zip
+        run: |
+          zip -9 -s 50m archive.zip "${{ steps.download.outputs.file_name }}"
+          ls -la archive.*
+          # Store chunk list in order (alphabetically: .z01, .z02, ..., .zip)
+          CHUNKS=$(ls archive.* | tr '\n' ' ')
+          echo "chunks=$CHUNKS" >> $GITHUB_OUTPUT
+
+      - name: Upload and send each chunk to Rubika
+        env:
+          BOT_TOKEN: ${{ secrets.RUBIKA_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.RUBIKA_CHAT_ID }}
+        run: |
+          for chunk in ${{ steps.zip.outputs.chunks }}; do
+            echo "--------------------------------------------------"
+            echo "Processing: $chunk"
+
+            # 1) Request upload URL
+            REQ_RESP=$(curl -sS -X POST \
+              "https://botapi.rubika.ir/v3/${BOT_TOKEN}/requestSendFile" \
+              -H "Content-Type: application/json" \
+              -d '{"type": "File"}')
+            echo "requestSendFile response: $REQ_RESP"
+
+            UPLOAD_URL=$(echo "$REQ_RESP" | jq -r '.upload_url')
+            if [ "$UPLOAD_URL" = "null" ] || [ -z "$UPLOAD_URL" ]; then
+              echo "❌ Could not obtain upload URL"
+              exit 1
+            fi
+
+            # 2) Upload the chunk
+            UPLOAD_RESP=$(curl -sS -X POST "$UPLOAD_URL" \
+              -F "file=@$chunk")
+            echo "Upload response: $UPLOAD_RESP"
+
+            FILE_ID=$(echo "$UPLOAD_RESP" | jq -r '.file_id')
+            if [ "$FILE_ID" = "null" ] || [ -z "$FILE_ID" ]; then
+              echo "❌ Could not obtain file_id"
+              exit 1
+            fi
+
+            # 3) Send the file to the chat
+            SEND_RESP=$(curl -sS -X POST \
+              "https://botapi.rubika.ir/v3/${BOT_TOKEN}/sendFile" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\": \"${CHAT_ID}\", \"file_id\": \"${FILE_ID}\", \"text\": \"Chunk: ${chunk}\"}")
+            echo "sendFile response: $SEND_RESP"
+
+            echo "✅ $chunk sent"
+          done
+          echo "All chunks delivered."
