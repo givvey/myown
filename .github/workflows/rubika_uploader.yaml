@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       file_urls:
-        description: 'Direct URLs of the files to download (one per line)'
+        description: 'Space-separated direct URLs of files to download'
         required: true
         type: string
 
@@ -15,71 +15,99 @@ jobs:
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y curl zip jq
 
-      - name: Process each URL
-        env:
-          BOT_TOKEN: ${{ secrets.RUBIKA_BOT_TOKEN }}
-          CHAT_ID:   ${{ secrets.RUBIKA_CHAT_ID }}
-          URLS:      ${{ inputs.file_urls }}
+      - name: Download files with unique names
+        id: download
         run: |
-          set -e
-          i=1
-          # Read URLs line by line (ignore empty lines)
-          while IFS= read -r url; do
-            # Skip empty lines
-            [[ -z "$url" ]] && continue
-            echo "=========================================="
-            echo "Processing file #$i: $url"
+          # Read the space-separated URLs into an array
+          IFS=' ' read -r -a urls <<< "${{ github.event.inputs.file_urls }}"
+          mkdir -p downloads
+          cd downloads
 
-            # Download with a unique local name to avoid collisions
-            DOWNLOAD_NAME="download_${i}"
-            curl -fsSL -o "$DOWNLOAD_NAME" "$url"
+          declare -A name_count  # track duplicate filenames
 
-            # Compress with maximum level and split into 50MiB chunks
-            ARCHIVE_PREFIX="archive_${i}"
-            zip -9 -s 50m "${ARCHIVE_PREFIX}.zip" "$DOWNLOAD_NAME"
-            rm -f "$DOWNLOAD_NAME"  # no longer needed
+          for url in "${urls[@]}"; do
+            [ -z "$url" ] && continue   # skip empty strings
+            echo "Downloading: $url"
 
-            # List chunks in correct numerical order
-            CHUNKS=$(ls -v ${ARCHIVE_PREFIX}.z* ${ARCHIVE_PREFIX}.zip 2>/dev/null)
-            if [[ -z "$CHUNKS" ]]; then
-              # In case zip produced only one part (no .z01, just .zip)
-              CHUNKS="${ARCHIVE_PREFIX}.zip"
+            # Extract base filename, strip query string
+            raw_name=$(basename "$url" | sed 's/?.*//')
+            base="${raw_name%.*}"        # name without extension
+            ext="${raw_name##*.}"        # extension (if any)
+            # Handle files with no extension
+            if [ "$base" = "$ext" ]; then
+              ext=""
+            else
+              ext=".$ext"
             fi
 
-            for chunk in $CHUNKS; do
-              echo "  Uploading chunk: $chunk"
+            # Determine unique filename inside downloads/
+            if [ -z "${name_count[$raw_name]}" ]; then
+              final_name="$raw_name"
+              name_count[$raw_name]=1
+            else
+              count=${name_count[$raw_name]}
+              final_name="${base}_${count}${ext}"
+              name_count[$raw_name]=$((count + 1))
+            fi
 
-              # 1) Request upload URL
-              REQ_RESP=$(curl -sS -X POST \
-                "https://botapi.rubika.ir/v3/${BOT_TOKEN}/requestSendFile" \
-                -H "Content-Type: application/json" \
-                -d '{"type": "File"}')
-              UPLOAD_URL=$(echo "$REQ_RESP" | jq -r '.upload_url')
-              if [[ "$UPLOAD_URL" == "null" || -z "$UPLOAD_URL" ]]; then
-                echo "❌ Could not obtain upload URL"
-                exit 1
-              fi
+            curl -fsSL -o "$final_name" "$url"
+            echo "Saved as: $final_name"
+          done
 
-              # 2) Upload the chunk
-              UPLOAD_RESP=$(curl -sS -X POST "$UPLOAD_URL" \
-                -F "file=@$chunk")
-              FILE_ID=$(echo "$UPLOAD_RESP" | jq -r '.file_id')
-              if [[ "$FILE_ID" == "null" || -z "$FILE_ID" ]]; then
-                echo "❌ Could not obtain file_id"
-                exit 1
-              fi
+          cd ..
+          echo "files_downloaded=true" >> $GITHUB_OUTPUT
 
-              # 3) Send to Rubika chat
-              SEND_RESP=$(curl -sS -X POST \
-                "https://botapi.rubika.ir/v3/${BOT_TOKEN}/sendFile" \
-                -H "Content-Type: application/json" \
-                -d "{\"chat_id\": \"${CHAT_ID}\", \"file_id\": \"${FILE_ID}\", \"text\": \"File #$i chunk: $chunk\"}")
-              echo "  ✅ Sent"
-            done
+      - name: Zip with maximum compression & split into 50 MB chunks
+        id: zip
+        run: |
+          cd downloads
+          # Zip all downloaded files (names are unique)
+          zip -9 -s 50m ../archive.zip *
+          cd ..
+          ls -la archive.*
+          CHUNKS=$(ls archive.* | tr '\n' ' ')
+          echo "chunks=$CHUNKS" >> $GITHUB_OUTPUT
 
-            # Clean up archive parts for this file
-            rm -f ${ARCHIVE_PREFIX}.z* ${ARCHIVE_PREFIX}.zip
-            ((i++))
-          done <<< "$URLS"
+      - name: Send each chunk to Rubika
+        env:
+          BOT_TOKEN: ${{ secrets.RUBIKA_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.RUBIKA_CHAT_ID }}
+        run: |
+          for chunk in ${{ steps.zip.outputs.chunks }}; do
+            echo "--------------------------------------------------"
+            echo "Processing: $chunk"
 
-          echo "All files processed and sent."
+            # 1) Request upload URL (type="File")
+            REQ_RESP=$(curl -sS -X POST \
+              "https://botapi.rubika.ir/v3/${BOT_TOKEN}/requestSendFile" \
+              -H "Content-Type: application/json" \
+              -d '{"type": "File"}')
+            echo "requestSendFile response: $REQ_RESP"
+
+            UPLOAD_URL=$(echo "$REQ_RESP" | jq -r '.data.upload_url')
+            if [ "$UPLOAD_URL" = "null" ] || [ -z "$UPLOAD_URL" ]; then
+              echo "❌ Could not obtain upload URL"
+              exit 1
+            fi
+
+            # 2) Upload the chunk
+            UPLOAD_RESP=$(curl -sS -X POST "$UPLOAD_URL" \
+              -F "file=@$chunk")
+            echo "Upload response: $UPLOAD_RESP"
+
+            FILE_ID=$(echo "$UPLOAD_RESP" | jq -r '.data.file_id')
+            if [ "$FILE_ID" = "null" ] || [ -z "$FILE_ID" ]; then
+              echo "❌ Could not obtain file_id"
+              exit 1
+            fi
+
+            # 3) Send the chunk to the chat
+            SEND_RESP=$(curl -sS -X POST \
+              "https://botapi.rubika.ir/v3/${BOT_TOKEN}/sendFile" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\": \"${CHAT_ID}\", \"file_id\": \"${FILE_ID}\", \"text\": \"Chunk: ${chunk}\"}")
+            echo "sendFile response: $SEND_RESP"
+
+            echo "✅ $chunk sent"
+          done
+          echo "All chunks delivered."
