@@ -51,7 +51,7 @@ jobs:
               -d '{"type": "File"}')
             echo "requestSendFile response: $REQ_RESP"
 
-            UPLOAD_URL=$(echo "$REQ_RESP" | jq -r '.upload_url')
+            UPLOAD_URL=$(echo "$REQ_RESP" | jq -r '.data.upload_url')
             if [ "$UPLOAD_URL" = "null" ] || [ -z "$UPLOAD_URL" ]; then
               echo "❌ Could not obtain upload URL"
               exit 1
@@ -62,7 +62,7 @@ jobs:
               -F "file=@$chunk")
             echo "Upload response: $UPLOAD_RESP"
 
-            FILE_ID=$(echo "$UPLOAD_RESP" | jq -r '.file_id')
+            FILE_ID=$(echo "$UPLOAD_RESP" | jq -r '.data.file_id')
             if [ "$FILE_ID" = "null" ] || [ -z "$FILE_ID" ]; then
               echo "❌ Could not obtain file_id"
               exit 1
